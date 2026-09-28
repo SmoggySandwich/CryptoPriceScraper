@@ -1,0 +1,18 @@
+# Runtime output: the collected dataset, its archives and the logs.
+data/
+logs/
+
+# The single-instance lock, if a stray one ever lands outside data/.
+.lock
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor and OS noise.
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

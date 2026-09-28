@@ -1,0 +1,22 @@
+# cron alternative to the systemd unit: poll once every five minutes.
+#
+# Install with `crontab -e`. Do not run this alongside the systemd service or
+# alongside loop mode -- they would contend for the same lock. (Contention is
+# handled safely, but only one of them would ever do useful work.)
+#
+# Two cron traps, both of which the script already defends against:
+#
+#   * cron's PATH is minimal, so `python3` may not resolve. Use an absolute
+#     interpreter path.
+#   * cron does not give you a useful working directory. All paths inside the
+#     scraper resolve relative to main.py rather than the CWD, so this is fine
+#     -- but any path *you* pass as an argument must be absolute too.
+
+# Poll every five minutes, appending output to a log.
+*/5 * * * * /usr/bin/python3 /opt/crypto-price-scraper/main.py --once >> /var/log/crypto-scraper.cron.log 2>&1
+
+# Note: cron starts jobs on a best-effort schedule and can run a few seconds
+# late under load, so row timestamps land at roughly :05:03 rather than exactly
+# :05:00. The timestamps record when the price was actually observed, which is
+# the honest value. Use the systemd unit in this directory if you want exact
+# grid alignment.

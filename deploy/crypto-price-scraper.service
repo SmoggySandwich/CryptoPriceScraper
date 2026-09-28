@@ -1,0 +1,46 @@
+# systemd unit for the loop run mode -- the recommended deployment on an
+# always-on Linux host. Loop mode keeps one process, one lock acquisition and
+# exact wall-clock grid alignment at 00:00, 00:05, 00:10 UTC.
+#
+# Install:
+#   sudo cp deploy/crypto-price-scraper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now crypto-price-scraper
+#   journalctl -u crypto-price-scraper -f
+#
+# Adjust ExecStart and the User below to match your checkout. WorkingDirectory
+# is not load bearing -- all paths resolve relative to main.py, never the CWD --
+# but it keeps relative overrides predictable.
+
+[Unit]
+Description=Crypto price scraper (BTC/ETH/HYPE daily CSV dataset)
+Documentation=file:///opt/crypto-price-scraper/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/crypto-price-scraper/main.py
+WorkingDirectory=/opt/crypto-price-scraper
+
+# The scraper is designed to be restarted without losing anything: the rolling
+# window is derived from the filenames on disk, so a restart mid-day simply
+# continues appending to today's CSVs.
+Restart=always
+RestartSec=30
+
+# SIGTERM is handled and releases the instance lock cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+User=cryptoscraper
+Group=cryptoscraper
+
+# It needs nothing beyond its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
