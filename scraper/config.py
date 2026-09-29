@@ -32,10 +32,12 @@ SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,15}$")
 #: CoinGecko ids appear in a URL query string.
 COIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
-#: Polling faster than this is hostile to a free API, so refuse rather than warn.
-MIN_POLL_SECONDS = 10
-#: The free tier's per-minute budget is shared per IP, so warn before this.
-WARN_POLL_SECONDS = 60
+#: Below this the tick cannot finish inside its own slot once a request has to
+#: time out, so refuse rather than warn.
+MIN_POLL_SECONDS = 5
+#: Warn below this: the retry budget cannot fit, so a slow tick starts eating
+#: the next slot. The shipped default of 10 sits at the threshold.
+WARN_POLL_SECONDS = 10
 
 DEFAULT_COINS: dict[str, str] = {
     "BTC": "bitcoin",
@@ -54,6 +56,8 @@ class ApiConfig:
     vs_currency: str
     timeout_seconds: float
     max_attempts: int
+    #: Failover venues get this instead of ``max_attempts`` -- normally 1.
+    failover_max_attempts: int
     backoff_initial: float
     backoff_multiplier: float
     backoff_max: float
@@ -99,6 +103,13 @@ class Config:
     collection: CollectionConfig
     storage: StorageConfig
     logging: LoggingConfig
+    #: Non-fatal problems found while parsing, carried rather than logged here.
+    #: ``load_config`` runs before ``setup_logging``, so anything it logged
+    #: would go to the root logger's stderr fallback: it would reach a console
+    #: but never ``logs/scraper.log``, and under ``pythonw.exe`` -- which is how
+    #: the scheduled task runs -- ``sys.stderr`` is None and it would vanish
+    #: completely. The caller emits these once the configured handlers exist.
+    warnings: tuple[str, ...] = ()
 
     @property
     def data_dir(self) -> Path:
@@ -255,40 +266,55 @@ def load_config(path: Path | str | None = None, *, base_dir: Path = BASE_DIR) ->
 
     reader = _Reader(parser, source)
 
+    # These defaults are sized for a ten-second slot, not the old five-minute
+    # one. The binding constraint is that a slow tick must not run into the slot
+    # after it, because nothing backfills a missed interval: a /ticker/price
+    # response is under a kilobyte, so a 10s timeout would spend the entire slot
+    # waiting before the first retry even began. Note that urllib applies its
+    # timeout per socket operation rather than as a deadline, so one "attempt"
+    # can cost roughly twice the configured value.
     api = ApiConfig(
         base_url=reader.string("api", "base_url", "https://api.coingecko.com/api/v3").rstrip("/"),
         vs_currency=reader.string("api", "vs_currency", "usd").lower(),
-        timeout_seconds=reader.number("api", "timeout_seconds", 10.0),
-        max_attempts=reader.integer("api", "max_attempts", 3),
-        backoff_initial=reader.number("api", "backoff_initial_seconds", 1.0),
+        timeout_seconds=reader.number("api", "timeout_seconds", 2.5),
+        max_attempts=reader.integer("api", "max_attempts", 2),
+        failover_max_attempts=reader.integer("api", "failover_max_attempts", 1),
+        backoff_initial=reader.number("api", "backoff_initial_seconds", 0.5),
         backoff_multiplier=reader.number("api", "backoff_multiplier", 2.0),
-        backoff_max=reader.number("api", "backoff_max_seconds", 10.0),
-        retry_after_cap=reader.number("api", "retry_after_cap_seconds", 60.0),
-        backoff_budget=reader.number("api", "backoff_budget_seconds", 75.0),
+        backoff_max=reader.number("api", "backoff_max_seconds", 1.0),
+        retry_after_cap=reader.number("api", "retry_after_cap_seconds", 2.0),
+        backoff_budget=reader.number("api", "backoff_budget_seconds", 3.0),
         user_agent=reader.string("api", "user_agent", "CryptoPriceScraper/1.0"),
     )
     if api.timeout_seconds <= 0:
         raise ConfigError(f"{source}: [api] timeout_seconds must be positive")
     if api.max_attempts < 1:
         raise ConfigError(f"{source}: [api] max_attempts must be at least 1")
+    if api.failover_max_attempts < 1:
+        raise ConfigError(f"{source}: [api] failover_max_attempts must be at least 1")
     if api.backoff_initial < 0 or api.backoff_max < 0 or api.backoff_multiplier < 1:
         raise ConfigError(
             f"{source}: [api] backoff_initial_seconds and backoff_max_seconds must be "
             f"non-negative and backoff_multiplier must be at least 1"
         )
 
-    poll_seconds = reader.integer("collection", "poll_seconds", 300)
+    poll_seconds = reader.integer("collection", "poll_seconds", 10)
     if poll_seconds < MIN_POLL_SECONDS:
         raise ConfigError(
             f"{source}: [collection] poll_seconds={poll_seconds} is too low; "
             f"the minimum is {MIN_POLL_SECONDS}"
         )
+    warnings: list[str] = []
     if poll_seconds < WARN_POLL_SECONDS:
-        logger.warning(
-            "poll_seconds=%d is below %d; free tiers rate limit per IP and short "
-            "intervals are the usual cause of 429s",
-            poll_seconds,
-            WARN_POLL_SECONDS,
+        # Reworded from the original, which blamed "free tiers rate limit per IP
+        # and short intervals are the usual cause of 429s". That was CoinGecko
+        # reasoning; the primary is now Binance, measured at well under 1% of its
+        # published weight budget at this cadence. The real risk is arithmetic:
+        # the retry budget no longer fits inside one slot.
+        warnings.append(
+            f"poll_seconds={poll_seconds} is below {WARN_POLL_SECONDS}; the retry "
+            f"budget (up to {api.backoff_budget:.1f}s of backoff plus "
+            f"{api.timeout_seconds:.1f}s per timed-out attempt) may not fit inside a slot"
         )
 
     collection = CollectionConfig(
@@ -311,8 +337,14 @@ def load_config(path: Path | str | None = None, *, base_dir: Path = BASE_DIR) ->
         data_dir=reader.path("storage", "data_dir", "data", base_dir=base_dir),
         delete_source=reader.boolean("storage", "delete_source_csv", True),
         compresslevel=compresslevel,
+        # Tightened from (0.2, 0.4, 0.8, 1.6) = 3.0s, which was affordable at a
+        # five-minute interval and is not at ten seconds. These delays now also
+        # gate the append open, so a locked CSV spends at most 0.75s before the
+        # row is given up on rather than the whole slot. Sharing violations are
+        # held for milliseconds in practice; the retries are there to ride out a
+        # scanner's momentary claim, not to wait out a wedged editor.
         remove_retry_delays=reader.floats(
-            "storage", "remove_retry_delays", (0.2, 0.4, 0.8, 1.6)
+            "storage", "remove_retry_delays", (0.05, 0.1, 0.2, 0.4)
         ),
         lock_wait_seconds=reader.number("storage", "lock_wait_seconds", 10.0),
     )
@@ -321,9 +353,16 @@ def load_config(path: Path | str | None = None, *, base_dir: Path = BASE_DIR) ->
         log_dir=reader.path("logging", "log_dir", "logs", base_dir=base_dir),
         filename=reader.string("logging", "log_filename", "scraper.log"),
         console_level=reader.level("logging", "console_level", logging.INFO),
-        file_level=reader.level("logging", "file_level", logging.DEBUG),
-        max_bytes=reader.integer("logging", "max_bytes", 1_048_576),
-        backup_count=reader.integer("logging", "backup_count", 5),
+        # INFO rather than DEBUG: the per-tick success line is now a debug
+        # detail and the loop writes a summary every ten minutes instead. The
+        # old 1 MiB x 5 was sized for 288 ticks a day and holds barely three
+        # days at 8,640 -- a problem noticed on Monday had already rotated out.
+        # 4 MiB x 10 is about 24 days. Larger files also shrink the window for
+        # the Windows rotation hazard, where a rename fails because something
+        # holds scraper.log open.
+        file_level=reader.level("logging", "file_level", logging.INFO),
+        max_bytes=reader.integer("logging", "max_bytes", 4 * 1_048_576),
+        backup_count=reader.integer("logging", "backup_count", 10),
     )
 
     return Config(
@@ -333,4 +372,5 @@ def load_config(path: Path | str | None = None, *, base_dir: Path = BASE_DIR) ->
         collection=collection,
         storage=storage,
         logging=log_cfg,
+        warnings=tuple(warnings),
     )

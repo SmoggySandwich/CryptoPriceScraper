@@ -4,11 +4,14 @@ The rollover is *stateless*.  Rather than tracking "the previous day" in memory
 or in a state file, every tick scans the data directory and archives any CSV
 whose filename date is strictly before today.
 
-That choice is forced by the ``--once`` run mode: the process exits every five
-minutes, so an in-memory notion of yesterday is worthless, and a state file
-would be one more thing to go stale or corrupt.  Deriving the work from the
+That was originally *forced* by the ``--once`` run mode: a process that exits
+every few minutes cannot remember yesterday.  ``--once`` is now only a first-run
+diagnostic and the loop is the deployment, so caching "the last day I saw" would
+be possible -- it is still not worth doing.  Deriving the work from the
 filesystem's own naming means loop mode, one-shot mode and crash recovery all
-execute the same code path, and running it twice is harmless.
+execute the same code path, and running it twice is harmless.  With the scan
+down to a few milliseconds per tick, that beats in-memory state that can go
+stale or corrupt.
 
 Two rules make that idempotence real:
 
@@ -39,10 +42,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, keeps store import-free
 CSV_COLUMNS: tuple[str, ...] = (
     "timestamp_utc",
     "price_usd",
-    "market_cap_usd",
-    "vol_24h_usd",
     "source",
 )
+
+#: Paths whose header has already been verified against :data:`CSV_COLUMNS` in
+#: this process, and paths already reported as mismatched.  Re-reading the header
+#: on every tick would be 25,920 opens a day to re-learn something that cannot
+#: change; the day label is part of the filename, so a midnight rollover is
+#: automatically a cache miss and none of this needs invalidating.
+_HEADER_OK: set[str] = set()
+_HEADER_BAD: set[str] = set()
 
 #: Anchored on purpose.  A ``glob("*.csv")`` would also match temp files and
 #: hand-made names; requiring the exact shape means anything we do not
@@ -57,6 +66,14 @@ _DEFAULT_LOGGER = logging.getLogger("scraper.store")
 
 class _LockedError(Exception):
     """A file could not be read because another handle holds it open."""
+
+
+class _SchemaMismatch(Exception):
+    """Two CSVs claim the same name but do not agree on their columns.
+
+    Distinct from a merge that simply finds nothing to add: here, keeping either
+    header would mis-describe half the rows, so neither file is touched.
+    """
 
 
 @dataclass(frozen=True)
@@ -93,12 +110,71 @@ def _format_number(value: float | None) -> str:
     sub-cent token price must survive as ``1.2345e-07``.  ``%.2f`` would flatten
     the latter to ``0.00``, and rounding would too.
 
-    A missing value becomes an empty field, never ``0``: blank means "not
-    published by this source", which is a different claim from a real zero.
+    The ``None`` branch is defensive: it dates from the market-cap and volume
+    columns, which were genuinely absent on venue rows.  The only column left is
+    ``price_usd``, which is never missing -- a row without a price is not written
+    at all.
     """
     if value is None:
         return ""
     return f"{float(value)!r}"
+
+
+def _parse_header_line(line: str) -> tuple[str, ...] | None:
+    """Parse a header line into its fields, or ``None`` if it is blank.
+
+    ``csv.reader`` rather than ``split(",")`` so a quoted header is parsed the
+    same way the writer that produced it would have been.
+    """
+    if not line.strip():
+        return None
+    rows = list(csv.reader([line]))
+    return tuple(rows[0]) if rows else None
+
+
+def _header_of(path: Path) -> tuple[str, ...] | None:
+    """Return the file's header fields, or ``None`` if it has no content yet."""
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            first = handle.readline()
+    except FileNotFoundError:
+        return None
+    return _parse_header_line(first)
+
+
+def _header_is_compatible(path: Path, logger: logging.Logger) -> bool:
+    """Whether a non-empty CSV may legally receive a row of the current schema.
+
+    This guards the one failure that leaves no trace: appending a 3-field row
+    under a 5-column header produces a file that still reads back with a correct
+    ``price_usd`` while ``source`` silently becomes ``None`` for every row after
+    the change.  Plausible data with corrupted provenance is worse than an
+    obvious error, so a mismatch refuses the write and leaves the bytes alone.
+
+    Reported once per path per process: a mismatched file stays mismatched all
+    day, and an ERROR every ten seconds would be 8,640 lines drowning the very
+    problem it describes.
+    """
+    key = str(path)
+    if key in _HEADER_OK:
+        return True
+    if key in _HEADER_BAD:
+        return False
+
+    fields = _header_of(path)
+    if fields is None or fields == CSV_COLUMNS:
+        _HEADER_OK.add(key)
+        return True
+
+    _HEADER_BAD.add(key)
+    logger.error(
+        "append: %s has header %s but this build writes %s; refusing to append. "
+        "Move or convert the file, or it will be left untouched all day.",
+        path.name,
+        ",".join(fields),
+        ",".join(CSV_COLUMNS),
+    )
+    return False
 
 
 def append_observations(
@@ -108,6 +184,8 @@ def append_observations(
     observations: Sequence["Observation"],
     *,
     fsync: bool = True,
+    retry_delays: tuple[float, ...] = (0.2, 0.4, 0.8, 1.6),
+    sleep=time.sleep,
     logger: logging.Logger = _DEFAULT_LOGGER,
 ) -> list[Path]:
     """Append one row per observation to that day's per-coin CSV.
@@ -116,6 +194,9 @@ def append_observations(
     Keeping a handle open across ticks would be faster and would also be a bug:
     on Windows a process cannot delete or rename a file that *any* handle holds
     open, including its own, so the rollover could never archive its own CSV.
+
+    Returns the files actually written; a file whose header does not match the
+    current schema is skipped rather than corrupted into.
     """
     data_dir = Path(data_dir)
     timestamp = iso_z(observed_at)
@@ -128,19 +209,31 @@ def append_observations(
     written: list[Path] = []
     for observation in observations:
         path = csv_path(data_dir, day, observation.symbol)
-        existed = path.exists()
-        needs_header = not existed or path.stat().st_size == 0
+        try:
+            size = path.stat().st_size
+            existed = True
+        except FileNotFoundError:
+            size = 0
+            existed = False
 
-        with path.open("a", encoding="utf-8", newline="") as handle:
+        # A pre-existing file with the wrong shape is left exactly as it is. The
+        # alternative -- appending anyway -- produces a file that still reads
+        # back with a correct price and a silently null source column.
+        if size and not _header_is_compatible(path, logger):
+            continue
+
+        handle = _open_append_with_retry(path, retry_delays, sleep, logger)
+        if handle is None:
+            continue
+
+        with handle:
             writer = csv.writer(handle, lineterminator="\n")
-            if needs_header:
+            if not size:
                 writer.writerow(CSV_COLUMNS)
             writer.writerow(
                 (
                     timestamp,
                     _format_number(observation.price_usd),
-                    _format_number(observation.market_cap_usd),
-                    _format_number(observation.vol_24h_usd),
                     observation.source,
                 )
             )
@@ -188,30 +281,40 @@ def archive_stale_csvs(
     retained: list[Path] = []
     failed: list[Path] = []
 
-    for entry in sorted(data_dir.iterdir()):
-        if not entry.is_file() or entry.name.startswith("."):
-            continue
+    candidates: list[tuple[Path, str, str]] = []
+    # os.scandir rather than Path.iterdir: DirEntry caches the attributes the
+    # directory listing already returned, while Path.is_file() is os.path.isfile,
+    # a fresh stat per entry that ignores that cache. At ~5 years of files that
+    # is the difference between ~4 ms and ~200 ms of every 10-second tick.
+    with os.scandir(data_dir) as scan:
+        for entry in sorted(scan, key=lambda item: item.name):
+            if not entry.is_file() or entry.name.startswith("."):
+                continue
 
-        match = CSV_NAME_RE.match(entry.name)
-        if match is None:
-            if entry.suffix == ".csv":
-                # A hand-made "2026-9-7_ETH.csv" would otherwise be ignored
-                # forever with no explanation.
-                logger.warning(
-                    "archive: ignoring %s; expected YYYY-MM-DD_SYMBOL.csv", entry.name
-                )
-            continue
+            match = CSV_NAME_RE.match(entry.name)
+            if match is None:
+                if entry.name.endswith(".csv"):
+                    # A hand-made "2026-9-7_ETH.csv" would otherwise be ignored
+                    # forever with no explanation.
+                    logger.warning(
+                        "archive: ignoring %s; expected YYYY-MM-DD_SYMBOL.csv",
+                        entry.name,
+                    )
+                continue
 
-        day = match.group("day")
-        day_date = parse_day_label(day)
-        if day_date is None or day_date >= today_date:
-            continue
+            day = match.group("day")
+            day_date = parse_day_label(day)
+            if day_date is None or day_date >= today_date:
+                continue
 
+            candidates.append((Path(entry.path), day, match.group("symbol")))
+
+    for csv_file, day, symbol in candidates:
         status, destination = _archive_one(
-            entry,
+            csv_file,
             data_dir,
             day,
-            match.group("symbol"),
+            symbol,
             delete_source=delete_source,
             compresslevel=compresslevel,
             retry_delays=retry_delays,
@@ -220,10 +323,12 @@ def archive_stale_csvs(
         )
         if status == "zipped":
             zipped.append(destination)
-            logger.info("archive: zipped %s", entry.name)
+            logger.info("archive: zipped %s", csv_file.name)
         elif status == "merged":
             merged.append(destination)
-            logger.info("archive: merged %s into existing %s", entry.name, destination.name)
+            logger.info(
+                "archive: merged %s into existing %s", csv_file.name, destination.name
+            )
         elif status == "locked":
             retained.append(destination)
         elif status == "failed":
@@ -290,7 +395,22 @@ def _archive_one(
         members.update(archived)
         previous = archived.get(csv_file.name)
         if previous is not None:
-            raw = _merge_csv(previous, raw)
+            try:
+                raw = _merge_csv(previous, raw)
+            except _SchemaMismatch as exc:
+                # Same reasoning as the unreadable-archive case above: refusing
+                # keeps both copies intact and surfaces in ArchiveResult.failed.
+                # Archiving the CSV alone would destroy the archived rows; the
+                # merge would corrupt them. Neither is acceptable for an
+                # operation that is supposed to be lossless.
+                logger.error(
+                    "archive: %s cannot merge into %s (%s); leaving %s in place",
+                    csv_file.name,
+                    destination.name,
+                    exc,
+                    csv_file.name,
+                )
+                return "failed", destination
 
     members[csv_file.name] = raw
 
@@ -386,9 +506,22 @@ def _merge_csv(existing: bytes, incoming: bytes) -> bytes:
     Sorting is by the full row, whose first field is an ISO-8601 ``Z``
     timestamp; that sorts lexicographically into chronological order, so the
     result is stable and the merge is idempotent.
+
+    Raises :class:`_SchemaMismatch` if the two copies do not share a header.
+    That case has to be refused rather than resolved: the de-duplication below
+    compares whole row strings, so a 5-field row can never equal a 3-field row
+    and both shapes would survive -- interleaved chronologically by the sort,
+    which removes the only visual signal that they differ.  The archive would
+    then be internally inconsistent and permanent, since ``testzip`` validates
+    checksums, not column counts.
     """
     header, rows = _split_csv(existing)
     incoming_header, incoming_rows = _split_csv(incoming)
+
+    fields = _parse_header_line(header)
+    other = _parse_header_line(incoming_header)
+    if fields and other and fields != other:
+        raise _SchemaMismatch(f"{','.join(other)} cannot join {','.join(fields)}")
     header = header or incoming_header
 
     merged = list(rows)
@@ -403,6 +536,38 @@ def _merge_csv(existing: bytes, incoming: bytes) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+
+
+def _open_append_with_retry(
+    path: Path, retry_delays: tuple[float, ...], sleep, logger: logging.Logger
+):
+    """Open a CSV for appending, retrying transient Windows sharing violations.
+
+    Returns the handle, or ``None`` if it could not be opened.  The archive path
+    has had this protection from the start; the append path had none, which made
+    a single AV scanner, indexer or backup agent holding today's CSV into a
+    ``PermissionError`` escaping ``append_observations`` and killing the tick.
+    A missed tick is unrecoverable -- nothing backfills it -- so this is worth
+    the retries even though the failure is rare.
+    """
+    last: OSError | None = None
+    for delay in (0.0, *retry_delays):
+        if delay:
+            sleep(delay)
+        try:
+            return path.open("a", encoding="utf-8", newline="")
+        except PermissionError as exc:  # WinError 32: in use by another handle
+            last = exc
+        except OSError as exc:
+            logger.error("append: cannot open %s: %s", path.name, exc)
+            return None
+    logger.warning(
+        "append: %s still locked after %d attempts (%s); skipping this tick",
+        path.name,
+        len(retry_delays) + 1,
+        last,
+    )
+    return None
 
 
 def _read_bytes_with_retry(
@@ -474,14 +639,18 @@ def _fsync_dir(path: Path) -> None:
 def _clean_orphan_temp_files(data_dir: Path, logger: logging.Logger) -> None:
     """Remove temp files left behind by a crash during an earlier zip."""
     cutoff = time.time() - _TEMP_MAX_AGE_SECONDS
-    for entry in data_dir.iterdir():
-        if not entry.is_file() or not entry.name.startswith("."):
-            continue
-        if not entry.name.endswith(".tmp"):
-            continue
-        try:
-            if entry.stat().st_mtime < cutoff:
-                entry.unlink()
-                logger.debug("archive: removed orphaned temp file %s", entry.name)
-        except OSError:
-            pass
+    with os.scandir(data_dir) as scan:
+        for entry in scan:
+            if not entry.is_file() or not entry.name.startswith("."):
+                continue
+            if not entry.name.endswith(".tmp"):
+                continue
+            try:
+                # DirEntry.stat() reuses the listing's cached attributes on
+                # Windows, so the common case -- a directory with no temp file
+                # at all -- never reaches the filesystem.
+                if entry.stat().st_mtime < cutoff:
+                    Path(entry.path).unlink()
+                    logger.debug("archive: removed orphaned temp file %s", entry.name)
+            except OSError:
+                pass

@@ -17,23 +17,27 @@ from scraper.fetch import Observation
 
 
 def api_config(**overrides) -> ApiConfig:
+    # Mirrors the real defaults in scraper/config.py. Tests that care about a
+    # specific budget pass it explicitly; keeping these realistic means the
+    # suite exercises the values that actually ship.
     values = dict(
         base_url="https://api.coingecko.com/api/v3",
         vs_currency="usd",
-        timeout_seconds=10.0,
-        max_attempts=3,
-        backoff_initial=1.0,
+        timeout_seconds=2.5,
+        max_attempts=2,
+        failover_max_attempts=1,
+        backoff_initial=0.5,
         backoff_multiplier=2.0,
-        backoff_max=10.0,
-        retry_after_cap=60.0,
-        backoff_budget=75.0,
+        backoff_max=1.0,
+        retry_after_cap=2.0,
+        backoff_budget=3.0,
         user_agent="test-agent/1.0",
     )
     values.update(overrides)
     return ApiConfig(**values)
 
 
-def make_config(tmp_path, *, enable_failover: bool = True, poll_seconds: int = 300) -> Config:
+def make_config(tmp_path, *, enable_failover: bool = True, poll_seconds: int = 10) -> Config:
     """A fully formed Config pointing at a temporary directory."""
     return Config(
         source_path=tmp_path / "config.ini",
@@ -132,15 +136,8 @@ def http_error(
     return urllib.error.HTTPError("https://example.test", code, "err", headers, io.BytesIO(body))
 
 
-def observation(symbol="BTC", price=100.0, *, cap=None, vol=None, source="coingecko") -> Observation:
-    return Observation(
-        symbol=symbol,
-        price_usd=price,
-        coin_id="",
-        market_cap_usd=cap,
-        vol_24h_usd=vol,
-        source=source,
-    )
+def observation(symbol="BTC", price=100.0, *, source="binance") -> Observation:
+    return Observation(symbol=symbol, price_usd=price, source=source)
 
 
 class FakeFetcher:

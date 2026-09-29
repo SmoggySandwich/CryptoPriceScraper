@@ -1,6 +1,14 @@
-# systemd unit for the loop run mode -- the recommended deployment on an
-# always-on Linux host. Loop mode keeps one process, one lock acquisition and
-# exact wall-clock grid alignment at 00:00, 00:05, 00:10 UTC.
+# systemd unit for the loop run mode -- the deployment on an always-on Linux
+# host. Loop mode keeps one process, one lock acquisition and exact wall-clock
+# grid alignment on the :00/:10/:20... UTC grid.
+#
+# Loop mode is not just one option among several. No scheduler can express a
+# ten-second cadence: cron floors at one minute by construction, and Windows Task
+# Scheduler rejects a sub-minute repetition outright (HRESULT 0x80041318). A
+# scheduled `--once` therefore runs at the scheduler's floor, not at poll_seconds,
+# which is the one way to end up believing you have ten-second data while
+# collecting sixty-second data. Use this unit, or the logon task in
+# crypto-price-scraper-task.xml.
 #
 # Install:
 #   sudo cp deploy/crypto-price-scraper.service /etc/systemd/system/
@@ -26,10 +34,20 @@ WorkingDirectory=/opt/crypto-price-scraper
 # The scraper is designed to be restarted without losing anything: the rolling
 # window is derived from the filenames on disk, so a restart mid-day simply
 # continues appending to today's CSVs.
+#
+# Restart=always is a backstop, not the primary recovery path. The process now
+# rides out transient failures itself -- a scanner holding today's CSV, a network
+# blip -- and only exits once 30 consecutive ticks have failed, about five
+# minutes of collecting nothing. It exits rather than spinning forever precisely
+# so that this directive can notice. The default start limit (5 starts per 10s)
+# does not interfere: a genuine total outage restarts the unit every ~5.5
+# minutes, far slower than the limit, so it keeps retrying instead of landing in
+# a failed state that nobody is watching.
 Restart=always
 RestartSec=30
 
-# SIGTERM is handled and releases the instance lock cleanly.
+# SIGTERM is handled and releases the instance lock cleanly. The handler can
+# wait out at most one sleep, which is under poll_seconds.
 KillSignal=SIGTERM
 TimeoutStopSec=20
 

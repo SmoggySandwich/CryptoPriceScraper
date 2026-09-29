@@ -2,7 +2,7 @@
 
 Builds a historical USD price dataset for **BTC, ETH and HYPE** by polling free
 APIs, writing one CSV per coin per trading day, and zipping each day's CSV once
-the day ends.
+the day ends. Defaults to one observation every **10 seconds**.
 
 Pure Python standard library. No `pip install`, no virtualenv, no build step.
 
@@ -24,46 +24,75 @@ Developed and tested on 3.14 on Windows 11; also runs on Linux.
 ## Quick start
 
 ```bash
-python main.py --once      # one poll, then exit
-python main.py             # run forever, every 5 minutes
+python main.py --once      # one poll, then exit (diagnostic)
+python main.py             # run forever, every 10 seconds
 ```
 
 Start here rather than with a scheduler: `--once` writes three CSVs in about a
 second and tells you immediately whether the network, the API and the paths all
 work.
 
+## Where the prices come from
+
+**Binance is the primary source**, and a single request per tick covers all three
+coins (`GET /api/v3/ticker/price?symbols=[...]`). It needs no API key. If it
+fails, the tick falls back to **CoinGecko**, then to **Hyperliquid** — each also
+one request for whatever is still missing.
+
+Which source produced each row is recorded in the `source` column.
+
+### Why not CoinGecko first
+
+CoinGecko's keyless `simple/price` endpoint is **cached server-side for one to two
+minutes**. That is a cache, not a rate limit, so no amount of throttling or
+retrying can defeat it: two probes ten seconds apart returned *identical values
+for all three coins*. Polling it every ten seconds would have produced a file
+that looks like ten-second resolution while carrying one-to-two-minute
+information — roughly six duplicate rows per real observation. It is a fine
+source, just not at this cadence, so it sits in the failover tier where its cache
+costs nothing.
+
+### What Binance costs
+
+`/api/v3/ticker/price` is **weight 4** against a per-IP budget of **6,000 per
+minute**. One request every ten seconds is 4 weight per tick, 24 per minute —
+**0.4% of the budget**. The headroom here is not a coincidence to be trimmed
+later; it is what makes the ten-second cadence safe without a key.
+
+### `timestamp_utc` is when we looked, not when the trade printed
+
+Binance's `ticker/price` returns only a symbol and a price. It carries **no venue
+timestamp**, and neither does the failover payload. So `timestamp_utc` records
+when the scraper observed the price, and a row is one observation rather than one
+trade. At ten-second resolution against a liquid pair the two are close, but they
+are not the same thing and the column should not be read as an execution time.
+
 ## What each row means
 
 ```csv
-timestamp_utc,price_usd,market_cap_usd,vol_24h_usd,source
-2026-09-28T00:35:52Z,84342.0,1695235215318.6294,22467410452.158356,coingecko
+timestamp_utc,price_usd,source
+2026-09-28T00:35:52Z,84342.0,binance
 ```
 
 | Column | Meaning |
 |---|---|
 | `timestamp_utc` | When the price was observed, ISO 8601 UTC, second precision. |
 | `price_usd` | Spot price in USD. Never blank. |
-| `market_cap_usd` | **Global** market cap. Blank if the source does not publish it. |
-| `vol_24h_usd` | **Global** 24h volume. Blank if the source does not publish it. |
-| `source` | Which API produced this row. |
+| `source` | Which API produced this row: `binance`, `coingecko` or `hyperliquid`. |
 
-Three things follow from the `source` column, and they matter:
+**The `source` column is not decoration.** The three venues do not agree exactly
+— measured seconds apart, CoinGecko and CoinPaprika differed by about 0.04% on
+BTC. Without `source` you would see a small discontinuity appear mid-series with
+no explanation. With it, you can filter to a single venue for a clean backtest,
+or measure the spread between them.
 
-**Blank is not zero.** A blank means "this source does not publish that number",
-which is a different claim from a real zero. A genuine zero is written `0.0`.
-
-**The `source` column is not decoration.** When CoinGecko fails, the bot fails
-over to Binance (BTC, ETH) or Hyperliquid (HYPE). Those venues do not agree
-exactly — measured seconds apart, CoinGecko and CoinPaprika differed by about
-0.04% on BTC. Without `source` you would see a small discontinuity appear
-mid-series with no explanation. With it, you can filter to a single venue for a
-clean backtest, or measure the spread between them.
-
-**`vol_24h_usd` has one meaning across the whole dataset.** CoinGecko reports
-*global* volume (BTC ≈ 21.9 B) while Binance's `quoteVolume` is *Binance only*
-(BTC ≈ 814 M) — a ~27× difference for the same concept. Rather than mixing them
-silently, failover rows leave `market_cap_usd` and `vol_24h_usd` blank and carry
-only the price. Only the price is truly comparable between venues.
+There are no `market_cap_usd` or `vol_24h_usd` columns, and their absence is
+deliberate rather than an omission. No keyless venue API publishes a *global*
+market cap, and Binance's `quoteVolume` is *Binance only* (BTC ≈ 814 M) against
+CoinGecko's global figure (BTC ≈ 21.9 B) — a ~27× difference for the same
+concept. A column that silently changes meaning depending on which source
+answered is worse than no column, so both were dropped and only `price_usd` — the
+one number that is genuinely comparable across venues — is recorded.
 
 ## Configuration
 
@@ -75,93 +104,122 @@ The interval you asked about:
 
 ```ini
 [collection]
-poll_seconds = 300        ; 300 = 5 minutes (default)
+poll_seconds = 10         ; 10 = ten seconds (default)
 ```
 
-Polling is aligned to the wall-clock grid (00:00, 00:05, 00:10 UTC) rather than
+Polling is aligned to the wall-clock grid (`:00`, `:10`, `:20`…) rather than
 counted from process start, so timestamps land on a predictable grid. The first
-poll happens immediately on start; no reason to wait a full interval just
-because the process started mid-slot.
+poll happens immediately on start; no reason to wait a full interval just because
+the process started mid-slot.
+
+The grid is recomputed from the clock every iteration rather than accumulated
+from the previous tick. If the machine suspends for nine hours, exactly one sleep
+happens on wake — an accumulated schedule would have queued ~3,240 immediate
+polls.
 
 | Section | Keys |
 |---|---|
-| `[api]` | `base_url`, `vs_currency`, `timeout_seconds`, `max_attempts`, `backoff_initial_seconds`, `backoff_multiplier`, `backoff_max_seconds`, `retry_after_cap_seconds`, `backoff_budget_seconds`, `user_agent` |
+| `[api]` | `base_url`, `vs_currency`, `timeout_seconds`, `max_attempts`, `failover_max_attempts`, `backoff_initial_seconds`, `backoff_multiplier`, `backoff_max_seconds`, `retry_after_cap_seconds`, `backoff_budget_seconds`, `user_agent` |
 | `[collection]` | `poll_seconds`, `enable_failover`, `binance_base_url`, `hyperliquid_url` |
 | `[storage]` | `data_dir`, `delete_source_csv`, `compresslevel`, `remove_retry_delays`, `lock_wait_seconds` |
 | `[logging]` | `log_dir`, `log_filename`, `console_level`, `file_level`, `max_bytes`, `backup_count` |
 | `[coins]` | `SYMBOL = coingecko_id` pairs |
 
-Adding a coin to `[coins]` starts a new CSV mid-day. Removing one does not
-orphan its existing file, because the rollover scans the data directory rather
-than the coin list. Keys are case-insensitive, so `BTC` and `btc` in the same
-file is a loud error rather than a silent override.
+Adding a coin to `[coins]` starts a new CSV mid-day. Removing one does not orphan
+its existing file, because the rollover scans the data directory rather than the
+coin list. Keys are case-insensitive, so `BTC` and `btc` in the same file is a
+loud error rather than a silent override.
 
-## Running it on a schedule
+The retry budget is sized for a ten-second slot, not for a five-minute one: a
+timeout of 2.5 s and a single retry on the primary, one attempt on each failover.
+`urllib`'s timeout applies *per socket operation*, not to the request as a whole,
+so a single attempt can cost about twice the configured value — the numbers are
+chosen pessimistically for that reason. A failover that fails has already told
+you everything the tick needs to know, and the next tick is ten seconds away.
 
-Pick **one** approach. Running two at once is safe — the single-instance lock
-prevents corruption — but only one will do useful work.
+Setting `poll_seconds` below 5 is rejected. The shipped value of 10 does not
+warn; anything below it does.
 
-### Windows: Task Scheduler
+## Running it
 
-`schtasks` has no working-directory option, and `python.exe` flashes a console
-window every five minutes. `pythonw.exe` avoids the flash, and every path inside
-the scraper resolves relative to `main.py`, so neither the CWD nor a relative
-`--config` is needed:
+**Loop mode is the deployment.** `python main.py` is the only supported way to
+run this at ten seconds, because no scheduler can express that cadence:
 
-```bash
-schtasks /Create /TN "CryptoPriceScraper" /F /SC MINUTE /MO 5 \
-  /TR "\"C:\Python314\pythonw.exe\" \"C:\Users\Mark-PC\Documents\CryptoPriceScraper\main.py\" --once"
-```
+* **cron** floors at one minute by construction.
+* **Task Scheduler** rejects a sub-minute repetition outright (HRESULT
+  `0x80041318`).
 
-Then tighten the defaults, which the `schtasks` flags cannot express:
+So a scheduled `--once` runs at the *scheduler's* floor, not at `poll_seconds`.
+Someone who set `poll_seconds = 10` and scheduled `--once` every minute would
+believe they had ten-second data while collecting sixty-second data. To make that
+impossible to miss, `--once` warns on startup whenever `poll_seconds < 60`.
+`--once` remains available as a first-run diagnostic: it writes three CSVs in
+about a second and proves the network, the API and the paths all work.
+
+### Windows
 
 ```powershell
-$s = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
-     -ExecutionTimeLimit (New-TimeSpan -Minutes 3) `
-     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-Set-ScheduledTask -TaskName "CryptoPriceScraper" -Settings $s
+powershell -ExecutionPolicy Bypass -File deploy\install-windows-task.ps1
 ```
 
-`ExecutionTimeLimit` matters: its default is measured in *days*, which is
-useless at a five-minute cadence and would let a wedged run overlap every
-subsequent run. Three minutes never fires spuriously — one tick is bounded by
-the retry budget — but catches a genuinely stuck process.
+No administrator prompt is needed. This registers a task that starts at logon and
+then loops forever; a logon trigger is a *one-shot* trigger, so the sub-minute
+restriction never applies to it. It runs `pythonw.exe`, so no console window
+appears.
 
-Task Scheduler runs jobs a few seconds late, so rows land at roughly `:05:03`
-rather than exactly `:05:00`. The timestamp records when the price was actually
-observed, which is the honest value.
+Two settings in that script are load-bearing:
 
-### Linux: systemd (recommended) or cron
+* `ExecutionTimeLimit` is set to `PT0S` — **no limit**. The Task Scheduler default
+  is three days, so leaving it unset would kill a perfectly healthy scraper every
+  third day, silently, as a "task stopped" event nobody is watching.
+* `RestartOnFailure` restarts it three times, one minute apart. That only fires on
+  a non-zero exit, and the program exits `4` solely after thirty consecutive
+  failed ticks — about five minutes of collecting nothing. Transient failures are
+  ridden out in-process and never reach the scheduler.
 
-See `deploy/`. The systemd unit runs loop mode on an always-on host; the crontab
-example runs `--once` every five minutes if you prefer.
+### Linux: systemd
+
+See `deploy/crypto-price-scraper.service`; install instructions are in its header.
+`Restart=always` there is a backstop rather than the primary recovery path, for
+the same reason described above.
 
 ## Exit codes
-
-Both schedulers surface these, so they are worth knowing:
 
 | Code | Meaning |
 |---|---|
 | `0` | Ran; rows written, or a benign no-op. |
 | `1` | Configuration or startup error. Nothing attempted. |
 | `2` | Another instance holds the lock (**loop mode only**). |
-| `3` | Every source failed; no rows written. |
-| `4` | Unexpected crash (traceback in `logs/main.crash.log`). |
+| `3` | Every source failed; no rows written (`--once` only). |
+| `4` | Gave up after 30 consecutive failed ticks, or an unexpected crash. |
 
 A scheduled `--once` that finds the lock held exits **`0`**, not `2`: under a
 scheduler that only means the loop already has it, which is not a failure and
 should not pollute the task's failure history.
 
+In loop mode a tick that raises is caught, logged and retried on the next slot
+rather than ending the run. The most plausible trigger is a Windows sharing
+violation — an AV scanner or sync client holding today's CSV open. Without that
+guard a single transient error would end a run that no scheduler is watching, and
+the loss would surface as a gap in the data days later. Thirty consecutive
+failures is the point at which looking alive while collecting nothing becomes
+worse than exiting for a supervisor to notice.
+
 ## How the rollover works
 
 There is no state file and no in-memory "yesterday". Every tick scans the data
 directory and archives any CSV whose *filename date* is earlier than today's UTC
-date. This is forced by `--once`: the process exits every five minutes, so
-anything held in memory is worthless, and a state file would be one more thing
-to corrupt. Loop mode, one-shot mode and crash recovery therefore run the same
-code path, and running it twice is harmless.
+date. Loop mode, one-shot mode and crash recovery therefore run the same code
+path, and running it twice is harmless.
 
-Three properties are load-bearing:
+That statelessness is no longer *forced* — it was originally required because
+`--once` exited every five minutes, and `--once` is now only a diagnostic — but
+it is kept. The scan is a few milliseconds, and the alternative (gating it on a
+day-change flag) reintroduces in-memory state and splits loop mode, one-shot mode
+and crash recovery into three paths that can drift apart. Not worth it at this
+price.
+
+Four properties are load-bearing:
 
 **An existing archive is never overwritten, only merged.** If the system clock
 steps backwards, a day label gets reused and the sweep may find a CSV for a day
@@ -178,23 +236,51 @@ archive is complete and valid.* A crash leaves only an ignorable temp file.
 **Each CSV is opened, written, flushed, fsynced and closed within a single
 tick.** `fsync` makes the row survive a power cut; closing immediately is what
 lets the rollover delete its own file. Windows refuses to delete a file that any
-handle holds open — *including the process's own* — so caching handles would
-make the bot unable to archive its own CSV.
+handle holds open — *including the process's own* — so caching handles would make
+the bot unable to archive its own CSV.
 
-A missed interval stays missed. There is no backfill, by design: gaps are
-visible and honest, and filled rows from a different endpoint would be of mixed
+**A CSV whose columns do not match this build is left untouched, and said so
+once.** See below.
+
+A missed interval stays missed. There is no backfill, by design: gaps are visible
+and honest, and filled rows from a different endpoint would be of mixed
 provenance.
+
+### The schema guard
+
+The dataset was previously five columns wide. Appending a three-field row under a
+five-column header corrupts the file *without producing anything that looks
+wrong*: read back, `price_usd` is correct, `source` silently becomes null, and
+`market_cap_usd` holds the word `binance`. Every sanity check on the price
+passes. That is the worst available failure shape — plausible data with corrupted
+provenance — so both places that can create it now refuse instead.
+
+* **On append**, if today's CSV exists and its header is not exactly
+  `timestamp_utc,price_usd,source`, the file is skipped, left byte-for-byte
+  untouched, and explained once in the log. The other two coins still get their
+  rows, and the refusal is logged once per file per process rather than once per
+  tick — a mismatched file stays mismatched all day, and 8,640 warning lines
+  would be the single largest consumer of the log budget.
+* **On merge**, if a CSV and the archive it would merge into have different
+  headers, the merge is refused, both files survive, and the failure is reported
+  in the rollover line. Auto-archiving on detection would *manufacture* the very
+  corruption being guarded against: the partial day enters the zip, and at the
+  next midnight sweep the fresh CSV merges into that same zip by filename.
+  Refusing and waiting is strictly safer — at 00:00 UTC the old file is zipped
+  with no merge at all, surviving as a clean five-column artifact.
 
 ## Troubleshooting
 
-**Repeated HTTP 429s.** Each tick is one request, so the load is 288/day
-(about 8,640/month). That is far inside the keyless per-minute budget of roughly
-10–30 requests/min per IP, and this bot is deliberately keyless. If you still see
-429s, the single lever available without an API key is to raise `poll_seconds` —
-600 would halve the request rate. The affected intervals appear as gaps.
+**Repeated HTTP 429s.** One request per tick is 8,640/day against Binance's
+6,000-weight-per-minute budget — about 0.4% of it at weight 4 per request. If you
+still see 429s, something else on the IP is consuming the budget. A source that
+returns `Retry-After` is *parked* for that long and skipped without issuing a
+request until the pause expires; the loop keeps ticking throughout, so honouring
+the pause costs nothing and nothing blocks. Capping the pause and continuing to
+poll is what escalates a 429 into an IP ban, which is why it is not done.
 
 **`CERTIFICATE_VERIFY_FAILED` on every attempt.** Something is intercepting
-HTTPS — usually antivirus or a corporate proxy, not CoinGecko. Do not disable
+HTTPS — usually antivirus or a corporate proxy, not the exchange. Do not disable
 certificate verification; fix the interception.
 
 **"malformed JSON" with an HTML snippet in the log.** Same cause: a proxy
@@ -216,13 +302,17 @@ reproduce this: the shell hands the process real stdio handles, so logging
 behaves normally and the check appears to pass without testing anything. The
 `None` case only happens when Task Scheduler starts it with no console at all.
 
+**No per-tick lines in the log.** That is intentional at ten seconds: an INFO
+line per tick would be 8,640 lines and over a megabyte a day, more log than the
+events it describes. The per-tick line still exists at DEBUG (set
+`file_level = DEBUG`), and in its place the loop logs a **summary every 60 ticks**
+— ten minutes — carrying ticks run, rows written, the per-symbol source mix,
+missing symbols, the slowest tick and the consecutive-failure count. That is
+strictly more useful than the raw stream, and it replaces the per-run history
+`--once` used to get for free from the scheduler.
+
 **On Linux, `data/` must not be on NFS.** `flock` is unreliable there, and the
 instance lock depends on it.
-
-**Row timestamps repeat for several intervals.** CoinGecko caches
-`simple/price` for one to two minutes, and illiquid assets repeat for longer.
-That is a real observation, not a bug, so identical values are written as-is
-rather than de-duplicated.
 
 ## Development
 
@@ -233,11 +323,11 @@ python -m unittest discover -s tests -t .
 The `-t .` is required — without it, discovery uses `tests/` as the top-level
 directory and `import scraper` fails to resolve.
 
-All 130 tests run without network access; HTTP, sleeping, the clock and the
-lock are injected. The suite is platform-neutral, with one test gated to each
-of Windows and POSIX for the "file is still open" behaviour, since the two
-platforms genuinely disagree about whether an open file can be deleted. Exactly
-one of those two skips, whichever platform you are on.
+All 169 tests run without network access; HTTP, sleeping, the clock and the lock
+are injected. The suite is platform-neutral, with one test gated to each of
+Windows and POSIX for the "file is still open" behaviour, since the two platforms
+genuinely disagree about whether an open file can be deleted. Exactly one of
+those two skips, whichever platform you are on.
 
 `test_logging_setup.py` covers the `pythonw` branch by setting `sys.stderr` to
 `None` in-process, which is the only way to exercise it deterministically:
@@ -247,13 +337,13 @@ does *not* reproduce the Task Scheduler situation.
 ### Layout
 
 ```
-main.py                  CLI, tick loop, exit codes, crash guard
+main.py                  CLI, tick loop, exit codes, crash guard, summary
 config.ini               documented configuration
 scraper/timeutil.py      UTC clock, day labels, grid alignment
 scraper/config.py        INI parsing and validation
-scraper/fetch.py         CoinGecko, Binance, Hyperliquid clients
-scraper/store.py         CSV append, rollover sweep, zip/merge
+scraper/fetch.py         Binance, CoinGecko and Hyperliquid clients
+scraper/store.py         CSV append, rollover sweep, zip/merge, schema guards
 scraper/locking.py       single-instance lock (msvcrt / fcntl)
-scraper/logging_setup.py UTC formatter, rotating file + console handlers
-deploy/                  systemd unit and crontab example
+scraper/logging_setup.py UTC formatter, rotating handlers, rate limiting
+deploy/                  systemd unit, Windows task installer
 ```

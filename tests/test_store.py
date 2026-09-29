@@ -13,7 +13,10 @@ from pathlib import Path
 from scraper import store
 from tests.helpers import FakeOpener, RecordingSleep, observation
 
-HEADER = "timestamp_utc,price_usd,market_cap_usd,vol_24h_usd,source\n"
+HEADER = "timestamp_utc,price_usd,source\n"
+#: The pre-2026-09-28 shape, kept so the guards can be tested against a file
+#: the current build must refuse to touch.
+OLD_HEADER = "timestamp_utc,price_usd,market_cap_usd,vol_24h_usd,source\n"
 
 
 class StoreTestCase(unittest.TestCase):
@@ -39,14 +42,14 @@ class AppendTests(StoreTestCase):
     def test_creates_csv_with_header_then_row(self):
         moment = datetime(2026, 9, 28, 0, 5, 3, tzinfo=UTC)
         written = store.append_observations(
-            self.data, "2026-09-28", moment, [observation("BTC", 84342.0, cap=1.5e12, vol=2.2e10)]
+            self.data, "2026-09-28", moment, [observation("BTC", 84342.0)]
         )
         self.assertEqual(len(written), 1)
         # LF only: newline="" stops the CRLF translation, so the file is
         # byte-identical on Windows and Linux.
         self.assertEqual(
             self.csv_path("2026-09-28", "BTC").read_bytes(),
-            HEADER.encode() + b"2026-09-28T00:05:03Z,84342.0,1500000000000.0,22000000000.0,coingecko\n",
+            HEADER.encode() + b"2026-09-28T00:05:03Z,84342.0,binance\n",
         )
 
     def test_second_append_adds_no_second_header(self):
@@ -67,31 +70,21 @@ class AppendTests(StoreTestCase):
         self.assertEqual(lines[0].split(",")[0], "timestamp_utc")
         self.assertEqual(len(lines), 2)
 
-    def test_missing_market_cap_and_volume_become_empty_fields(self):
-        # Blank means "this source does not publish it", which is a different
-        # claim from a real zero.
+    def test_a_failover_source_is_recorded_verbatim(self):
+        # The source column is what makes a venue switch visible instead of
+        # looking like a price move, so it is written as-is, not normalised.
         store.append_observations(
             self.data,
             "2026-09-28",
             datetime(2026, 9, 28, tzinfo=UTC),
-            [observation("HYPE", 91.3, cap=None, vol=None, source="hyperliquid")],
+            [observation("HYPE", 91.3, source="hyperliquid")],
         )
         row = self.csv_path("2026-09-28", "HYPE").read_text(encoding="utf-8").splitlines()[1]
-        self.assertEqual(row, "2026-09-28T00:00:00Z,91.3,,,hyperliquid")
-
-    def test_an_actual_zero_is_written_as_zero_not_blank(self):
-        store.append_observations(
-            self.data,
-            "2026-09-28",
-            datetime(2026, 9, 28, tzinfo=UTC),
-            [observation("BTC", 1.0, cap=0.0, vol=0.0)],
-        )
-        row = self.csv_path("2026-09-28", "BTC").read_text(encoding="utf-8").splitlines()[1]
-        self.assertEqual(row, "2026-09-28T00:00:00Z,1.0,0.0,0.0,coingecko")
+        self.assertEqual(row, "2026-09-28T00:00:00Z,91.3,hyperliquid")
 
     def test_integer_price_is_normalised_to_float(self):
-        # CoinGecko sends 84386 as a JSON int; repr keeps the output uniform and
-        # round-trip exact without flattening sub-cent prices.
+        # Binance sends prices as JSON strings, CoinGecko as ints; repr keeps the
+        # output uniform and round-trip exact without flattening sub-cent prices.
         store.append_observations(
             self.data,
             "2026-09-28",
@@ -124,7 +117,7 @@ class AppendTests(StoreTestCase):
 class SweepTests(StoreTestCase):
     def test_zips_and_deletes_a_previous_day(self):
         path = self.csv_path("2026-09-26", "ETH")
-        path.write_text(HEADER + "2026-09-26T00:00:00Z,100.0,,,coingecko\n", encoding="utf-8")
+        path.write_text(HEADER + "2026-09-26T00:00:00Z,100.0,coingecko\n", encoding="utf-8")
 
         result = self.sweep("2026-09-28")
 
@@ -152,7 +145,7 @@ class SweepTests(StoreTestCase):
 
     def test_is_idempotent(self):
         self.csv_path("2026-09-26", "ETH").write_text(
-            HEADER + "2026-09-26T00:00:00Z,100.0,,,coingecko\n", encoding="utf-8"
+            HEADER + "2026-09-26T00:00:00Z,100.0,coingecko\n", encoding="utf-8"
         )
         self.sweep("2026-09-28")
         before = self.zip_path("2026-09-26", "ETH").read_bytes()
@@ -171,11 +164,11 @@ class SweepTests(StoreTestCase):
         with zipfile.ZipFile(zip_file, "w") as archive:
             archive.writestr(
                 "2026-09-26_ETH.csv",
-                HEADER + "2026-09-26T00:00:00Z,111.0,,,coingecko\n",
+                HEADER + "2026-09-26T00:00:00Z,111.0,coingecko\n",
             )
 
         self.csv_path("2026-09-26", "ETH").write_text(
-            HEADER + "2026-09-26T00:05:00Z,222.0,,,coingecko\n", encoding="utf-8"
+            HEADER + "2026-09-26T00:05:00Z,222.0,coingecko\n", encoding="utf-8"
         )
 
         result = self.sweep("2026-09-28")
@@ -190,7 +183,7 @@ class SweepTests(StoreTestCase):
     def test_merge_of_identical_content_is_a_no_op(self):
         # The crash-between-write-and-delete case: the CSV is already archived.
         path = self.csv_path("2026-09-26", "ETH")
-        body = HEADER + "2026-09-26T00:00:00Z,111.0,,,coingecko\n"
+        body = HEADER + "2026-09-26T00:00:00Z,111.0,coingecko\n"
         path.write_text(body, encoding="utf-8")
         self.sweep("2026-09-28")
 
@@ -229,7 +222,7 @@ class SweepTests(StoreTestCase):
         corrupt = self.zip_path("2026-09-26", "ETH")
         corrupt.write_bytes(b"this is not a zip file")
         csv_file = self.csv_path("2026-09-26", "ETH")
-        csv_file.write_text(HEADER + "2026-09-26T00:00:00Z,1.0,,,coingecko\n", encoding="utf-8")
+        csv_file.write_text(HEADER + "2026-09-26T00:00:00Z,1.0,coingecko\n", encoding="utf-8")
 
         with self.assertLogs("scraper.store", level="ERROR") as captured:
             result = self.sweep("2026-09-28")
@@ -241,7 +234,7 @@ class SweepTests(StoreTestCase):
 
     def test_reports_a_truncated_final_line_without_repairing_it(self):
         path = self.csv_path("2026-09-26", "ETH")
-        path.write_bytes(HEADER.encode() + b"2026-09-26T00:00:00Z,1.0,,,coingecko")  # no \n
+        path.write_bytes(HEADER.encode() + b"2026-09-26T00:00:00Z,1.0,coingecko")  # no \n
         with self.assertLogs("scraper.store", level="WARNING") as captured:
             self.sweep("2026-09-28")
         self.assertIn("does not end with a newline", "\n".join(captured.output))
@@ -276,6 +269,167 @@ class SweepTests(StoreTestCase):
             self.sweep("not-a-day")
 
 
+class AppendSchemaGuardTests(StoreTestCase):
+    """Appending across a schema change must fail loudly, not quietly.
+
+    A three-field row written under a five-column header still reads back with a
+    correct ``price_usd``; only ``source`` silently becomes None. That is the
+    worst available outcome, because every sanity check on the price passes
+    while the column that explains venue discontinuities has quietly emptied.
+    """
+
+    def _existing(self, header: str) -> str:
+        original = header + "2026-09-28T00:00:00Z,1.0,123.0,456.0,coingecko\n"
+        self.csv_path("2026-09-28", "BTC").write_text(original, encoding="utf-8")
+        return original
+
+    def test_a_file_with_the_old_header_is_refused_and_left_intact(self):
+        original = self._existing(OLD_HEADER)
+
+        with self.assertLogs("scraper.store", level="ERROR") as captured:
+            written = store.append_observations(
+                self.data,
+                "2026-09-28",
+                datetime(2026, 9, 28, tzinfo=UTC),
+                [observation("BTC", 2.0)],
+            )
+
+        self.assertEqual(written, [])
+        self.assertEqual(
+            self.csv_path("2026-09-28", "BTC").read_text(encoding="utf-8"), original
+        )
+        self.assertIn("refusing to append", "\n".join(captured.output))
+
+    def test_one_bad_file_does_not_cost_the_other_symbols_their_rows(self):
+        self._existing(OLD_HEADER)
+
+        with self.assertLogs("scraper.store", level="ERROR"):
+            written = store.append_observations(
+                self.data,
+                "2026-09-28",
+                datetime(2026, 9, 28, tzinfo=UTC),
+                [observation("BTC", 2.0), observation("ETH", 3.0)],
+            )
+
+        self.assertEqual(written, [self.csv_path("2026-09-28", "ETH")])
+        self.assertTrue(self.csv_path("2026-09-28", "ETH").exists())
+
+    def test_the_refusal_is_reported_once_per_file_not_once_per_tick(self):
+        # At ten seconds a per-tick ERROR would be 8,640 lines a day, drowning
+        # out the very problem it describes.
+        self._existing(OLD_HEADER)
+
+        with self.assertLogs("scraper.store", level="ERROR") as captured:
+            for _ in range(3):
+                store.append_observations(
+                    self.data,
+                    "2026-09-28",
+                    datetime(2026, 9, 28, tzinfo=UTC),
+                    [observation("BTC", 2.0)],
+                )
+
+        self.assertEqual(len(captured.output), 1)
+
+    def test_a_matching_header_is_accepted_without_rechecking_every_tick(self):
+        store.append_observations(
+            self.data,
+            "2026-09-28",
+            datetime(2026, 9, 28, tzinfo=UTC),
+            [observation("BTC", 1.0)],
+        )
+        # Corrupt the header underneath the memo. The memo is per-process and
+        # keyed by path, which is sound because a file's header cannot change
+        # without the process doing it, and the day label is in the filename.
+        store.append_observations(
+            self.data,
+            "2026-09-28",
+            datetime(2026, 9, 28, tzinfo=UTC),
+            [observation("BTC", 2.0)],
+        )
+        text = self.csv_path("2026-09-28", "BTC").read_text(encoding="utf-8")
+        self.assertEqual(len(text.strip().splitlines()), 3)
+
+
+class MergeSchemaGuardTests(StoreTestCase):
+    """A mismatched merge corrupts an archive permanently and silently.
+
+    ``_merge_csv`` de-duplicates whole row strings, so a five-field row can
+    never equal a three-field one and both shapes would survive -- interleaved
+    chronologically by the sort, which removes the only visual signal. The zip
+    is then CRC-valid and byte-stable, so nothing downstream ever notices.
+    """
+
+    def test_a_mismatched_header_is_refused_rather_than_reconciled(self):
+        with self.assertRaises(store._SchemaMismatch):
+            store._merge_csv(
+                (OLD_HEADER + "2026-09-26T00:00:00Z,1.0,2.0,3.0,coingecko\n").encode(),
+                (HEADER + "2026-09-26T00:05:00Z,1.0,coingecko\n").encode(),
+            )
+
+    def test_matching_headers_still_union(self):
+        merged = store._merge_csv(
+            (HEADER + "2026-09-26T00:00:00Z,1.0,coingecko\n").encode(),
+            (HEADER + "2026-09-26T00:05:00Z,2.0,coingecko\n").encode(),
+        )
+        self.assertEqual(merged.count(b"timestamp_utc"), 1)
+        self.assertIn(b"1.0", merged)
+        self.assertIn(b"2.0", merged)
+
+    def test_an_unreadable_header_does_not_block_the_merge(self):
+        # A zero-byte or truncated copy has no header to disagree with, so the
+        # one real header wins and its rows are not discarded.
+        merged = store._merge_csv(
+            b"",
+            (HEADER + "2026-09-26T00:05:00Z,2.0,coingecko\n").encode(),
+        )
+        self.assertEqual(merged.decode(), HEADER + "2026-09-26T00:05:00Z,2.0,coingecko\n")
+
+    def test_the_sweep_keeps_both_files_and_reports_failure(self):
+        zip_file = self.zip_path("2026-09-26", "BTC")
+        with zipfile.ZipFile(zip_file, "w") as archive:
+            archive.writestr(
+                "2026-09-26_BTC.csv",
+                OLD_HEADER + "2026-09-26T00:00:00Z,111.0,222.0,333.0,coingecko\n",
+            )
+        csv_file = self.csv_path("2026-09-26", "BTC")
+        csv_file.write_text(HEADER + "2026-09-26T00:05:00Z,222.0,binance\n", encoding="utf-8")
+
+        with self.assertLogs("scraper.store", level="ERROR") as captured:
+            result = self.sweep("2026-09-28")
+
+        self.assertEqual(result.failed, (zip_file,))
+        self.assertEqual(result.archived, 0)
+        self.assertIn("cannot merge", "\n".join(captured.output))
+        # Neither copy is touched, so nothing is lost and a human can decide.
+        self.assertTrue(csv_file.exists())
+        with zipfile.ZipFile(zip_file) as archive:
+            self.assertIn("111.0", archive.read("2026-09-26_BTC.csv").decode())
+
+
+class DirectoryScanTests(StoreTestCase):
+    """The sweep walks with os.scandir, which caches the listing's stat data.
+
+    Behaviourally identical to Path.iterdir, which is the point: these pin the
+    properties the faster walk must not lose.
+    """
+
+    def test_a_directory_shaped_like_a_csv_is_skipped(self):
+        (self.data / "2026-09-26_ETH.csv").mkdir()
+
+        result = self.sweep("2026-09-28")
+
+        self.assertFalse(result.acted)
+        self.assertTrue((self.data / "2026-09-26_ETH.csv").is_dir())
+
+    def test_a_temp_directory_does_not_break_the_orphan_cleanup(self):
+        (self.data / ".stale.tmp").mkdir()
+
+        result = self.sweep("2026-09-28")
+
+        self.assertFalse(result.acted)
+        self.assertTrue((self.data / ".stale.tmp").is_dir())
+
+
 class LockedFileTests(StoreTestCase):
     """Windows and POSIX disagree about deleting a file that is open.
 
@@ -285,7 +439,7 @@ class LockedFileTests(StoreTestCase):
 
     def _sweep_with_open_handle(self):
         path = self.csv_path("2026-09-26", "ETH")
-        path.write_text(HEADER + "2026-09-26T00:00:00Z,1.0,,,coingecko\n", encoding="utf-8")
+        path.write_text(HEADER + "2026-09-26T00:00:00Z,1.0,coingecko\n", encoding="utf-8")
         handle = path.open("a", encoding="utf-8")
         self.addCleanup(handle.close)
         return path, self.sweep("2026-09-28")

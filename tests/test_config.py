@@ -35,17 +35,18 @@ class ConfigTestCase(unittest.TestCase):
 class DefaultTests(ConfigTestCase):
     def test_defaults_apply_when_sections_are_missing(self):
         cfg = self.load(MINIMAL)
-        self.assertEqual(cfg.collection.poll_seconds, 300)
+        self.assertEqual(cfg.collection.poll_seconds, 10)
         self.assertTrue(cfg.collection.enable_failover)
         self.assertTrue(cfg.storage.delete_source)
         self.assertEqual(cfg.api.vs_currency, "usd")
-        self.assertEqual(cfg.api.max_attempts, 3)
+        self.assertEqual(cfg.api.max_attempts, 2)
+        self.assertEqual(cfg.api.failover_max_attempts, 1)
 
     def test_repo_config_ini_loads(self):
         # The shipped file must stay valid; it is the documented schema.
         cfg = load_config(Path(__file__).resolve().parent.parent / "config.ini")
         self.assertEqual(cfg.collection.coins, {"BTC": "bitcoin", "ETH": "ethereum", "HYPE": "hyperliquid"})
-        self.assertEqual(cfg.collection.poll_seconds, 300)
+        self.assertEqual(cfg.collection.poll_seconds, 10)
 
     def test_defaults_when_the_coins_section_is_absent(self):
         cfg = self.load("[collection]\npoll_seconds = 120\n")
@@ -111,12 +112,24 @@ class ValidationTests(ConfigTestCase):
 
     def test_poll_seconds_below_the_floor_is_rejected(self):
         with self.assertRaises(ConfigError) as ctx:
-            self.load(MINIMAL + "\n[collection]\npoll_seconds = 5\n")
+            # Below MIN_POLL_SECONDS the tick cannot finish inside its own slot,
+            # which is a structural failure rather than a warning: the row it
+            # loses is never backfilled.
+            self.load(MINIMAL + "\n[collection]\npoll_seconds = 4\n")
         self.assertIn("too low", str(ctx.exception))
 
+    def test_the_shipped_interval_is_not_a_warning(self):
+        # The default must be quiet, or every fresh install logs a warning.
+        self.assertEqual(self.load(MINIMAL).warnings, ())
+
     def test_a_short_interval_warns(self):
-        with self.assertLogs("scraper.config", level="WARNING"):
-            self.load(MINIMAL + "\n[collection]\npoll_seconds = 30\n")
+        # Carried on the Config rather than logged here: load_config runs before
+        # setup_logging, so anything it logged would reach a console but never
+        # the log file -- and under pythonw.exe there is no console at all.
+        cfg = self.load(MINIMAL + "\n[collection]\npoll_seconds = 8\n")
+        self.assertEqual(len(cfg.warnings), 1)
+        self.assertIn("poll_seconds=8", cfg.warnings[0])
+        self.assertIn("retry budget", cfg.warnings[0])
 
     def test_non_numeric_values_name_the_section_and_key(self):
         with self.assertRaises(ConfigError) as ctx:
@@ -160,7 +173,7 @@ class LoadFailureTests(ConfigTestCase):
 
     def test_an_empty_file_is_valid_and_uses_every_default(self):
         cfg = self.load("")
-        self.assertEqual(cfg.collection.poll_seconds, 300)
+        self.assertEqual(cfg.collection.poll_seconds, 10)
         self.assertEqual(set(cfg.collection.coins), {"BTC", "ETH", "HYPE"})
 
 

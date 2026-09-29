@@ -12,6 +12,7 @@ silently.  Every log line would vanish with no trace.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 import traceback
@@ -22,6 +23,53 @@ from pathlib import Path
 from .config import LoggingConfig
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s [pid=%(process)d] %(name)s: %(message)s"
+
+#: The crash log is written outside the logging system and so has no rotation of
+#: its own. It is bounded here rather than left to grow without limit: a crash
+#: loop is exactly when this file matters, and is also when it would fill a disk.
+_CRASH_LOG_MAX_BYTES = 1_048_576
+
+
+class RateLimitedLogger:
+    """Log a repeated message on first sight, then at most every ``every`` seconds.
+
+    The failure this exists for is a single config typo: one bad symbol makes
+    Binance's batch endpoint answer 400 on every tick, which at a ten-second
+    cadence is 8,640 identical WARNINGs a day. Those lines would consume the
+    entire log budget and rotate out the earlier entries that explain how the
+    problem started. The first occurrence is never suppressed, because that is
+    the one that tells you what changed.
+    """
+
+    def __init__(self, every: float = 300.0, *, now=time.monotonic) -> None:
+        self._every = every
+        self._now = now
+        self._last: dict[tuple, float] = {}
+
+    def should_log(self, key: tuple) -> bool:
+        """Whether ``key`` is due. Records the attempt when it returns ``True``."""
+        moment = self._now()
+        previous = self._last.get(key)
+        if previous is not None and moment - previous < self._every:
+            return False
+        self._last[key] = moment
+        return True
+
+    def log(self, target: logging.Logger, level: int, key: tuple, message: str, *args) -> None:
+        if self.should_log(key):
+            target.log(level, message, *args)
+
+
+def _rotate_crash_log(path: Path) -> None:
+    """Keep one previous generation of the crash log. Never raises."""
+    try:
+        if path.stat().st_size < _CRASH_LOG_MAX_BYTES:
+            return
+        # os.replace rather than unlink-then-rename: it overwrites the backup
+        # atomically, and it cannot lose the current log if it fails halfway.
+        os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
 
 
 class UtcFormatter(logging.Formatter):
@@ -84,6 +132,7 @@ def log_unhandled_exception(exc: BaseException, base_dir: Path) -> None:
     crash_log = base_dir / "logs" / "main.crash.log"
     try:
         crash_log.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_crash_log(crash_log)
         stamp = datetime.now(UTC).isoformat(timespec="seconds")
         with crash_log.open("a", encoding="utf-8") as handle:
             handle.write(f"\n===== {stamp} =====\n")

@@ -11,7 +11,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from scraper.config import LoggingConfig
-from scraper.logging_setup import UtcFormatter, log_unhandled_exception, setup_logging
+from scraper.logging_setup import (
+    RateLimitedLogger,
+    UtcFormatter,
+    log_unhandled_exception,
+    setup_logging,
+)
 
 
 class LoggingTestCase(unittest.TestCase):
@@ -138,6 +143,76 @@ class CrashLogTests(LoggingTestCase):
         blocker = self.base / "blocker"
         blocker.write_text("not a directory", encoding="utf-8")
         log_unhandled_exception(RuntimeError("x"), blocker)  # must not raise
+
+    def test_the_crash_log_is_bounded(self):
+        # This file is only ever written when something has already gone badly
+        # wrong, and it used to append without any rotation at all -- so the
+        # worse the problem, the larger the file describing it grew.
+        from scraper.logging_setup import _CRASH_LOG_MAX_BYTES
+
+        crash = self.base / "logs" / "main.crash.log"
+        crash.parent.mkdir(parents=True, exist_ok=True)
+        crash.write_text("x" * (_CRASH_LOG_MAX_BYTES + 1), encoding="utf-8")
+
+        log_unhandled_exception(RuntimeError("after the big one"), self.base)
+
+        # One previous generation is kept, and the current file starts over.
+        self.assertTrue(crash.with_name("main.crash.log.1").exists())
+        text = crash.read_text(encoding="utf-8")
+        self.assertIn("after the big one", text)
+        self.assertLess(len(text), _CRASH_LOG_MAX_BYTES)
+
+    def test_a_small_crash_log_is_not_rotated(self):
+        crash = self.base / "logs" / "main.crash.log"
+        crash.parent.mkdir(parents=True, exist_ok=True)
+        crash.write_text("small\n", encoding="utf-8")
+
+        log_unhandled_exception(RuntimeError("second"), self.base)
+
+        self.assertFalse(crash.with_name("main.crash.log.1").exists())
+        self.assertIn("small", crash.read_text(encoding="utf-8"))
+
+
+class RateLimitedLoggerTests(unittest.TestCase):
+    """The first occurrence is never suppressed -- it is the one that matters."""
+
+    def setUp(self):
+        self.clock = [1000.0]
+        self.limiter = RateLimitedLogger(every=300.0, now=lambda: self.clock[0])
+        self.logger = logging.getLogger("scraper.test.repeat")
+        self.logger.setLevel(logging.DEBUG)
+
+    def test_the_first_occurrence_always_logs(self):
+        self.assertTrue(self.limiter.should_log(("BTC", "binance")))
+
+    def test_repeats_within_the_window_are_suppressed(self):
+        self.limiter.should_log(("BTC", "binance"))
+        self.clock[0] += 299.0
+        self.assertFalse(self.limiter.should_log(("BTC", "binance")))
+
+    def test_the_window_reopens(self):
+        self.limiter.should_log(("BTC", "binance"))
+        self.clock[0] += 300.0
+        self.assertTrue(self.limiter.should_log(("BTC", "binance")))
+
+    def test_keys_are_independent(self):
+        # A second symbol going missing must be reported even though the first
+        # one was reported a moment ago.
+        self.limiter.should_log(("BTC", "binance"))
+        self.assertTrue(self.limiter.should_log(("HYPE", "binance")))
+
+    def test_log_writes_through_at_the_recorded_level(self):
+        with self.assertLogs(self.logger, level="WARNING") as captured:
+            self.limiter.log(self.logger, logging.WARNING, ("BTC", "binance"), "gone: %s", "BTC")
+        self.assertEqual(captured.records[0].getMessage(), "gone: BTC")
+
+    def test_a_suppressed_repeat_writes_nothing(self):
+        # Wrapped in assertLogs rather than called bare so the expected first
+        # record is captured instead of propagating to the suite's output.
+        with self.assertLogs(self.logger, level="WARNING"):
+            self.limiter.log(self.logger, logging.WARNING, ("BTC", "binance"), "gone")
+        with self.assertNoLogs(self.logger, level="DEBUG"):
+            self.limiter.log(self.logger, logging.WARNING, ("BTC", "binance"), "gone again")
 
 
 if __name__ == "__main__":
